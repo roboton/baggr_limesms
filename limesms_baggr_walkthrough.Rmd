@@ -1,0 +1,707 @@
+---
+title: "Baggr Meta-analysis of SMS input adoption trials"
+author: Robert On ^[roberton@gmail.com]
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+```{r setup}
+devtools::install_github("wwiecek/baggr@devel")
+library(tidyverse)
+library(baggr)
+
+set.seed(143)
+num_iters <- 10000
+num_chains <- min(8, parallel::detectCores(logical = FALSE) - 1)
+options(mc.cores = num_chains)
+```
+
+Below we use the [`baggr`](https://github.com/wwiecek/baggr) to analyze data from six randomized controlled trials estimating the effect of SMS messaging on the adoption of agricultural inputs.
+
+## Set up
+
+### Trial data
+
+We have individual farmer trial data from all six RCTs with several columns of data. The most important are those that contain the trial, treatment status indicator and the outcome (lime adoption) observed for each farmer. There are additional columns that contain individual covariates, additional treatment descriptors, and additional outcomes.
+
+`pooled_data.dta` is a file produced from previous Stata do files put together by [Raissa Fabregas](mailto:rfabregas@utexas.edu) and [Giulia Zane](giulia.zane@gmail.com). These do files have not been made available to date.
+
+```{r}
+pooled <- haven::read_dta("pooled_data_orig.dta")
+pooled %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  summary()
+```
+Only the fourteen columns below contain non-missing data, suggesting that they would be useful candidates for the meta-analysis across all six studies.
+
+```{r}
+pooled %>%
+  select(where(~ mean(is.na(.x)) == 0)) %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  summary()
+```
+However, only 6 of these columns contain variation (> 1 distinct value) within each trial. Without variation within each trial, the column won't be useful as a covariate for the meta-analysis.
+
+- `treated` is our primary treatment indicator of whether or not the farmer received messaging
+- `large_shamba` describes whether or not the farmer had a large plot
+- `num_messages` are the number of message received by the farmer
+- `lime_messages` are the number of messages received about lime adoption
+- `followed_lime_1all` is whether or not the farmer followed the recommendation on lime
+- `large_shamba_sms` determines whether a farmer with a large plot received was treated (received messaging)
+
+Since `num_messages`, `lime_messages` and `large_shamba_sms` are all additional descriptors of `treated`, we will not be using them as additional covariates. The only viable covariate is `large_shamba`. `followed_lime_1all` will be the binary outcome we focus on for this analysis.
+
+```{r}
+pooled %>%
+  group_by(sample) %>%
+  summarise(across(everything(), n_distinct)) %>%
+  select(where(~ all(.x != 1)))
+```
+
+From the trial data we assemble baggr-friendly individual and aggregate data frames. We start with the individual data frame by removing ineligible covariates and outcomes and renaming the remaining columns to group (trial), treatment (received SMS) and outcome (adopted lime).
+
+The aggregate data frame is created by aggregating to a, b, c, d and n1, and n2 conventions where:
+
+- `a` counts the number of events (lime adoptions) in the treatment group
+- `b` counts the number of non-events in the treatment group
+- `c` counts the number of events (lime adoptions) in the control group
+- `d` counts the number of non-events in the control group
+- `n1` counts the total number of farmers in the treatment group
+- `n2` counts the total number of farmers in the control group
+
+```{r}
+(limesms_ind <- pooled %>%
+  select(where(~ mean(is.na(.x)) == 0)) %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  select(-program, -large_shamba_sms,
+         -num_messages, -lime_messages, -fert_messages,
+         -treatment, -treat_overall1, -treat_overall2,
+         -school, -area) %>%
+  group_by(sample) %>%
+  mutate(is_test = rbinom(n = n(), size = 1, prob = 0.2)) %>%
+  ungroup() %>%
+  rename(treatment = treated,
+         group = sample,
+         outcome = followed_lime_1all) %>%
+   prepare_ma(effect = "logOR", summarise = FALSE) %>%
+  mutate(large_shamba = pooled$large_shamba))
+
+(limesms_agg <- limesms_ind %>% group_by(group, treatment) %>%
+  summarise(event = sum(outcome == 1), nonevent = sum(outcome == 0),
+            .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = c(event, nonevent)) %>%
+  rename(a = event_1, b = nonevent_1, c = event_0, d = nonevent_0)  %>%
+  mutate(n1 = a + b, n2 = c + d) %>% prepare_ma(effect = "logOR"))
+```
+
+### Odds or Risk Ratio
+
+Risk ratios diverge from odds ratios at higher event probabilities. This doesn't appear to matter much for our meta-analysis as the dotted (Risk Ratio) line more or less coincides with the dashed (Odds Ratio) line. Larger circles translate to smaller treatment effect standard errors.
+
+```{r}
+labbe(limesms_agg, plot_model = TRUE, shade_se = "or")
+```
+
+
+## Aggregate baggr meta-analysis
+
+We run a model with partial pooling (random effects) with `r num_iters` iterations over `r num_chains` MCMC chains. We also pick some conservative values for `adapt_delta` and `max_treedepth` to ensure convergence.
+
+```{r}
+(limesms_agg_meta <- baggr(
+  data = limesms_agg, 
+  pooling = "partial",
+  effect = "logarithm of odds ratio",
+  iter = num_iters, chains = num_chains,
+  control = list(adapt_delta = 0.99, max_treedepth = 15)))
+```
+
+We find the log odds treatment effects in the table above with its corresponding pooling estimate.
+
+### Plots
+
+The first plot estimates the posterior odds ratio for each of the studies with 50% of the probability mass contained in the inner (darker) interval and 95% contained in the outer interval. They hypermean is pooled effect across all six studies.
+
+```{r}
+baggr::baggr_plot(limesms_agg_meta, hyper = TRUE, style = "intervals",
+                  order = FALSE, transform = exp,
+                  prob = 0.5, prob_outer = 0.95) +
+  xlab("Effect size: Odds ratio")
+```
+
+This second plot is a forest plot which shows a table summary and boxplot visualization of each of the study estimates. The table summary summarizes the mean treatment effect on odds ratios along with its standard deviation. The plot on the right visualizes the mean estimate along with the 95% intervals.
+
+```{r}
+forest_plot(limesms_agg_meta, show = "both", transform = exp,
+            effects = "Odds ratio")
+```
+
+The third plot simply plots the distribution of values for the posterior estimate of the odds ratio treatment effect.
+
+```{r}
+baggr::effect_plot(limesms_agg_meta, transform = exp) +
+  xlab("Odds Ratio")
+```
+
+### Pooling effects
+
+The plot below compares the different models with full, none, or partial pooling.
+
+```{r}
+limesms_agg_metac <- baggr_compare(
+  limesms_agg, effect = "Odds ratio",
+  iter = num_iters, chains = num_chains,
+  control = list(adapt_delta = 0.99, max_treedepth = 15))
+
+plot(limesms_agg_metac, transform = exp)
+```
+
+The treatment effect posteriors are compared for the full and partial pooling models.
+
+```{r}
+effect_plot(
+  partial = limesms_agg_metac$models$partial,
+  full = limesms_agg_metac$models$full,
+  transform = exp)
+```
+### Heterogeneity
+
+Estimates of pooling measures the extent by which the individual treatment effect gets pulled towards the overall average treatment effect.
+
+```{r}
+(het_est <- heterogeneity(limesms_agg_meta, metric = "isq")[,,1] %>%
+  cbind(pooling(limesms_agg_meta, metric = "isq")[,,1]) %>%
+  as.data.frame() %>%
+  rownames_to_column("stat") %>%
+  set_names(c("Stat", "Overall", attr(limesms_agg_meta$inputs, "group_label"))))
+```
+
+### Cross-validation
+
+```{r}
+limesms_agg_cv_partial <- loocv(limesms_agg, pooling = "partial",
+                                iter = num_iters, chains = num_chains,
+                                control = list(adapt_delta = 0.99,
+                                               max_treedepth = 15))
+
+limesms_agg_cv_full <- loocv(limesms_agg, pooling = "full",
+                             iter = num_iters, chains = num_chains,
+                             control = list(adapt_delta = 0.99,
+                                            max_treedepth = 15))
+
+loo_compare(limesms_agg_cv_partial, limesms_agg_cv_full) 
+```
+
+### Table 3
+
+```{r}
+(lime_adopt <- c(
+  treatment_effect(limesms_agg_meta, summary = TRUE, transform = exp)$tau[1:3],
+  het_est$Overall) %>%
+  set_names(c("2.5%", "Mean TE", "97.5%", "2.5%", "I^2", "97.5%")))
+```
+
+### All outcomes and outputs
+
+Below we examine which variables are fully non-missing for each sample. We pick one of the three models to produce: aggregate, individual, or coefficient.
+
+```{r}
+pooled %>%
+  mutate(across(is.character, ~ if_else(.x == "", NA_character_, .x))) %>%
+  group_by(sample) %>%
+  summarise(across(everything(), ~ mean(is.na(.x)) == 0)) %>%
+  select(where(~ is.character(.x) || sum(.x) >= 4)) %>%
+  pivot_longer(-sample) %>%
+  pivot_wider(names_from = sample, values_from = value) %>%
+  arrange(desc(across(-name)))
+```
+
+Functions to compute all outputs for each outcome:
+```{r}
+baggr_outcome <- function(pooled, outcome = "followed_lime_1all") {
+  ind_dat <- pooled %>%
+    mutate(across(where(is.character), as.factor)) %>%
+    # for cross-validation
+    group_by(sample) %>%
+    mutate(is_test = rbinom(n = n(), size = 1, prob = 0.2)) %>%
+    ungroup() %>%
+    # rename to baggr friendly names
+    rename(treatment_type = treatment,
+           treatment = treated,
+           group = sample,
+           outcome = {{ outcome }}) %>%
+    filter(!is.na(outcome)) %>%
+    # make baggr thing!
+    prepare_ma(effect = "logOR", summarise = FALSE)
+  
+  agg_dat <- ind_dat %>% group_by(group, treatment) %>%
+    summarise(event = sum(outcome == 1), nonevent = sum(outcome == 0),
+              .groups = "drop") %>%
+    pivot_wider(names_from = treatment, values_from = c(event, nonevent)) %>%
+    rename(a = event_1, b = nonevent_1, c = event_0, d = nonevent_0)  %>%
+    mutate(n1 = a + b, n2 = c + d) %>% prepare_ma(effect = "logOR")
+  
+  agg_meta_mdl <- baggr(
+    data = agg_dat, 
+    pooling = "partial",
+    effect = "logarithm of odds ratio",
+    iter = num_iters, chains = num_chains,
+    control = list(adapt_delta = 0.99, max_treedepth = 15)) 
+  
+  bg_plot <- baggr::baggr_plot(agg_meta_mdl, hyper = TRUE,
+                               style = "intervals", order = FALSE,
+                               transform = exp, prob = 0.5, prob_outer = 0.95) +
+    geom_vline(xintercept = 1, lty = 2, alpha = 0.2) +
+    xlab("Effect size: Odds ratio")
+  
+  
+  fst_plot <- forest_plot(agg_meta_mdl, show = "both", transform = exp,
+                          effects = "Odds ratio")
+  
+  eff_plot <- baggr::effect_plot(agg_meta_mdl, transform = exp) +
+    xlab("Odds Ratio") +
+    geom_vline(xintercept = 1, lty = 2, alpha = 0.2) +
+    xlim(c(0, 2))
+  
+  comp_mdl <- baggr_compare(
+    agg_dat, effect = "Odds ratio",
+    iter = num_iters, chains = num_chains,
+    control = list(adapt_delta = 0.99, max_treedepth = 15))
+  # comp_mdl <- baggr_compare(agg_meta_mdl)
+
+  comp_plot <- plot(comp_mdl, transform = exp) +
+    geom_hline(yintercept = 1, lty = 2, alpha = 0.2)
+  
+  eff_comp_plot <- effect_plot(
+    partial = comp_mdl$models$partial,
+    full = comp_mdl$models$full,
+    transform = exp) +
+    geom_vline(xintercept = 1, lty = 2, alpha = 0.2) +
+    xlim(c(0, 2))
+  
+  het_est <- heterogeneity(agg_meta_mdl, metric = "isq")[,,1] %>%
+    cbind(pooling(agg_meta_mdl, metric = "isq")[,,1]) %>%
+    as.data.frame() %>%
+    rownames_to_column("stat") %>%
+    set_names(c("Stat", "Overall", attr(agg_meta_mdl$inputs, "group_label")))
+  
+  reg_line <- c(
+    treatment_effect(agg_meta_mdl, summary = TRUE, transform = exp)$tau[1:3],
+    set_names(het_est$Overall)) %>%
+    set_names(c("2.5%", "Mean TE", "97.5%", "2.5%", "I^2", "97.5%"))
+
+  return(list(outcome = outcome,
+              agg_dat = agg_dat, ind_dat = ind_dat,
+              agg_meta_mdl = agg_meta_mdl,
+              bg_plot = bg_plot,
+              fst_plot = fst_plot, eff_plot = eff_plot, comp_mdl = comp_mdl,
+              comp_plot = comp_plot, eff_comp_plot = eff_comp_plot,
+              het_est = het_est, reg_line = reg_line))
+}
+```
+
+Computing the models and outcomes:
+
+```{r}
+library(tidyverse)
+library(baggr)
+
+set.seed(143)
+num_iters <- 10000
+num_chains <- min(8, parallel::detectCores(logical = FALSE) - 1)
+options(mc.cores = num_chains)
+pooled <- haven::read_dta("R code_Lime/pooled_data_orig.dta") %>%
+  mutate(sample = case_when(
+    sample == "KALRO" ~ "KALRO",
+    sample == "PAD1" ~ "IPA/PAD1-Kenya",
+    sample == "PAD2" ~ "IPA/PAD2-Kenya",
+    sample == "OAF1" ~ "OAF1-Kenya",
+    sample == "OAF2" ~ "OAF2-Kenya",
+    sample == "OAF3" ~ "OAF3-Rwanda"
+  )) %>%
+  mutate(sample = factor(sample, levels = c("KALRO",
+                                            "IPA/PAD1-Kenya",
+                                            "IPA/PAD2-Kenya",
+                                            "OAF1-Kenya",
+                                            "OAF2-Kenya",
+                                            "OAF3-Rwanda"))) %>%
+  rename(`Heard Lime` = heard_lime_E,
+         `Knowledge Acidity` = knows_lime_E,
+         `Lime Rec` = followed_lime_1all,
+         `Fertilizer Rec` = followed_fert_1all)
+
+heard_mdl <- baggr_outcome(pooled, "Heard Lime")
+knows_mdl <- baggr_outcome(pooled, "Knowledge Acidity")
+follow_mdl <- baggr_outcome(pooled, "Lime Rec")
+# (NEED TO DROP THE OAF2 FARMERS THAT ARE TREATED WITH LIME - ONLY (lime_only)
+# AND KEEP ONLY LIME_CAN AND CONTROL)
+fert_follow_mdl <- baggr_outcome(
+  pooled %>% filter(sample != "OAF2-Kenya" | lime_only == 0), "Fertilizer Rec")
+```
+
+Formatting the output
+
+```{r}
+library(huxtable)
+mdls <- list(heard_mdl, knows_mdl, follow_mdl, fert_follow_mdl)
+
+(map_dfr(mdls, ~ .x$reg_line) %>%
+  set_names(c("Effect 95% lower", "Effect", "Effect 95% upper",
+              "I^2 95% lower", "$I^2$", "I^2 95% upper")) %>%
+  bind_cols(N = map_dbl(mdls, ~ .x$agg_meta_mdl$n_groups)) %>%
+  bind_cols(Outcome = map_chr(mdls, ~ .x$outcome)) %>%
+  mutate(`Row #` = row_number()) %>%
+  select(`Row #`, Outcome, N, Effect, starts_with("Effect 95"),
+         "$I^2$", starts_with("I^2 95")) -> main_results) %>%
+  as_hux() %>%
+  set_escape_contents(1, 7, FALSE) %>%
+  set_contents(1, c(5, 8), "95% CrI") %>%
+  insert_row("", "", "", "Effects", "", "", "Heterogeneity", "", "", after = 0) %>%
+  insert_row("", "", "(1)", "(2)", "(3)", "(4)", "(5)", "(6)", "(7)",
+             after = 2) %>%
+  merge_cells(1, 4:6) %>% merge_cells(1, 7:9) %>%
+  merge_cells(2, 5:6) %>% merge_cells(2, 8:9) %>%
+  set_align(1:3, 3:9, "center") %>%
+  set_align(everywhere, 1:2, "left") %>%
+  set_number_format(4:7, 4:9, "%.3f") %>%
+  insert_row("", "Odds Ratios", "", "", "", "", "", "", "", after = 3) %>%
+  set_top_border(1, everywhere, brdr(1, "double")) %>%
+  set_bottom_border(final(1), everywhere, brdr(1, "double")) %>%
+  set_bottom_border(3, everywhere, brdr(1, "solid")) %>%
+  set_italic(4, 2) %>%
+  set_all_padding(everywhere, everywhere, 0) -> tbl3
+
+main_results %>%
+  mutate(across(c(where(is.double), -N), ~ format(.x, digits = 3))) %>%
+  write_delim(file  = fs::path("output", "table3_baggr_minimal.tex"),
+              delim = "&", eol = "\\\\\n", quote = "none",
+              col_names = FALSE)
+
+tbl3 %>%
+  quick_latex(file = fs::path("output", "table3_baggr.tex"), open = FALSE)
+
+tbl3 %>%
+  quick_pdf(file = fs::path("output", "table3_baggr.pdf"), open = FALSE)
+
+sapply(mdls, function(mdl) {
+  outcome <- mdl$outcome
+  outputs <- names(mdl)
+  sapply(outputs, function(output) {
+    if (class(mdl[[output]])[[1]] == "gg") {
+      filename <- fs::path("output", str_c(output, "_", outcome, ".png"))
+      ggsave(plot = mdl[[output]], filename = filename)
+    }
+  })
+})
+```
+
+## Individual baggr meta-analysis 
+
+The individual meta-analysis model is nearly identical to the summary model and would only be useful if we had additional individual level characteristics to include. However, the baggr package seems to throw an error when including covariates, described in this [issue](https://github.com/wwiecek/baggr/issues/113). This model also takes very long to run, about a day when utilizing 8 cores for 8 MCMC chains.
+
+```{r}
+ind_covars <- c("large_shamba")
+
+# (1) changing pooling_baseline option,
+# (2) prior_hypersd = normal(0, 10)
+# (3) prior_control to normal with smaller SD but a sensible mean
+# (this is the log rate of events in your control arm,
+# so you should have some mildly informative prior, like being able to tell
+# whether you expect 1% of subjects or 50% of them to do something throughout the study)
+
+limesms_ind_meta_file <- stringr::str_c(
+  "limesms_ind_meta_", num_chains, "c_", num_iters, "i_",
+  stringr::str_c(ind_covars, collapse = "_"), ".rds")
+
+if (fs::file_exists(limesms_ind_meta_file)) {
+  (limesms_ind_meta <- readr::read_rds(limesms_ind_meta_file))
+} else {
+  (limesms_ind_meta <- readr::write_rds(baggr(
+    data = readr::read_rds("limesms_ind.rds"),
+    pooling = "partial",
+    covariates = ind_covars,
+    effect = "logarithm of odds ratio",
+    prior_hypersd = normal(-1, 10),
+    prior_control = normal(log(0.08), 1),
+    prior_control_sd = normal(0, 2^2),
+    iter = 1000, #num_iters,
+    chains = num_chains,
+    control = list(adapt_delta = 0.99, max_treedepth = 15)),
+    file = stringr::str_c("limesms_ind_meta_", num_chains, "c_", 1000, "i_",
+                          stringr::str_c(ind_covars, collapse = "_"), ".rds")))
+}
+
+# rbind(heterogeneity(limesms_agg_meta, metric = "isq")[,,1],
+#       heterogeneity(limesms_ind_meta, metric = "isq")[,,1]) %>%
+#   as_tibble() %>%
+#   mutate(Heterogeneity = c("Aggregate", "Individual")) %>%
+#   select(Heterogeneity, everything())
+# 
+# rbind(
+#   cbind("aggregate", pooling(limesms_agg_meta, metric = "isq")[,,1]),
+#   cbind("individual", pooling(limesms_ind_meta, metric = "isq")[,,1])) %>%
+#   as_tibble(rownames = "estimate") %>%
+#   unite(V1, V1, estimate, sep = " ") %>%
+#   set_names(c("estimate", attr(limesms_ind_meta$inputs, "group_label"))) %>%
+#   pivot_longer(-estimate, names_to = "Pooling") %>%
+#   pivot_wider(names_from = estimate)
+  
+(bgc <- baggr_compare(
+  "Summary-level (Rubin model on logOR)" = limesms_agg_meta,
+  "Individual-level (logistic model)"    = limesms_ind_meta 
+))
+plot(bgc, transform = exp)
+```
+
+The prior adjustment hints helped these chains converge. They produce results that are almost identical to the aggregate baggr outcomes. These models take so long to run it's not likely they will be useful for our purposes.
+
+## Coefficient baggr meta-analysis
+
+It was highlighted by Giulia that the previous analysis simply used baggr with estimates from regressions using frequentist analysis. This doesn't depend on using the data directly but uses summary statistics from earlier analysis stored in a file `meta_20210720.xlsx`.
+
+### Constructing the data frames
+
+```{r}
+# This reads the xlsx file and saves different frames 
+coef_sheets <- readxl::excel_sheets("meta_20210720.xlsx")
+coef_dat <- map(coef_sheets,
+                ~ readxl::read_excel("meta_20210720.xlsx", .x)) %>%
+  set_names(coef_sheets)
+
+coef_dat$recommended_preliminary <- readxl::read_excel(
+  "combined_results_20201205.xlsx", sheet="recommended")
+coef_dat$other_preliminary <- readxl::read_excel(
+  "combined_results_20201205.xlsx", sheet="other")
+
+coef_dat <- coef_dat %>%
+  keep(~ any(names(.x) %in% c("coeff"))) %>%
+  map(~ .x %>% rename(tau = coeff) %>%
+        mutate(sample = case_when(
+          str_detect(sample, "PAD1") ~ "PAD1",
+          str_detect(sample, "PAD2") ~ "PAD2",
+          str_detect(sample, "OAF1") ~ "OAF1",
+          str_detect(sample, "OAF2") ~ "OAF2",
+          str_detect(sample, "OAF3") ~ "OAF3",
+          TRUE ~ sample
+        )))
+
+# Knowledge
+coef_dat$know_1 <- subset(coef_dat$knowledge, type=="lor" & variable=="knowledge1")
+coef_dat$know_2 <- subset(coef_dat$knowledge, type=="lor" & variable=="knowledge2")
+
+# Adoption
+coef_dat$adoption_lime <- subset(
+  coef_dat$adoption, type=="lor" & (variable=="lime1a" | (variable=="lime2a" & sample=="KALRO")))
+
+coef_dat$adoption_fertilizer <- subset(
+  coef_dat$adoption, type=="lor" & (variable=="fert1a" | (variable=="fert2a" & sample=="KALRO")))
+
+# Persistence and Fatigue
+coef_dat$persistence_lime <- subset(
+  coef_dat$persistence,
+  second_season_type=="treated s1" & type=="lor" &
+    (variable=="lime2a" | (variable=="lime2s" & sample=="PAD2")))
+
+coef_dat$fatigue_lime <- subset(
+  coef_dat$persistence,
+  type=="lor" & variable=="lime2a" & second_season_type=="treated s1 and s2")
+
+coef_dat$persistence_fert <- subset(
+  coef_dat$persistence,
+  second_season_type=="treated s1" & type=="lor" &
+    (variable=="fert2a" |
+       (variable=="fert2s" & sample %in% c("PAD2", "PAD1"))))
+
+# Quantities
+# Baggr models don't run for these non-binary outcomes (error)
+coef_dat$kg_lime <- subset(coef_dat$quantity,
+                           (variable=="limekg1a" | (variable=="limekg2a" & sample=="KALRO")))
+coef_dat$kg_fert <- subset(coef_dat$quantity,
+                           (variable=="fertkg1a" | (variable=="fertkg2a" & sample=="KALRO")))
+```
+
+### Comparing to Aggregate/Individual models
+
+We take note that the coefficient model has much higher estimates for the lime adoption outcome compared to the individual and summary level model with baggr. This is presumably due to inclusion of controls which did not 
+
+```{r}
+# Setting priors 
+# These priors Raissa got from Science paper, but not sure this all works in logs 
+# We should probably check with Witold
+priors_custom <- list(hypermean = normal(0,1), 
+                      hypersd = cauchy(0,1))
+
+# Computing the partial pooling models
+limesms_coef_meta <- baggr(coef_dat$adoption_lime,
+      effect = "logarithm of odds ratio",
+      group = "sample",
+      prior = priors_custom,
+      iter = num_iters, chains = num_chains,
+      control = list(adapt_delta = 0.99))
+
+(bgc <- baggr_compare(
+  "Summary-level (Rubin model on logOR)" = limesms_agg_meta,
+  "Individual-level (logistic model)" = limesms_ind_meta,
+  "Coefficient model" = limesms_coef_meta
+))
+
+plot(bgc)
+```
+
+### Computing models and outputs
+
+```{r}
+# *_preliminary data from combined_results_20201205.xlsx doesn't appear to
+# have the required columns to compute baggr model
+# > names(coef_dat$adoption_lime) %>% sort()
+# [1] "lci"      "n"        "sample"   "se"       "tau"      "type"    
+# [7] "uci"      "variable"
+# > names(coef_dat$recommended_preliminary) %>% sort()
+# [1] "input"    "mean_lor" "sample"   "se"       "se_mean"  "tau"     
+# [7] "type"    
+# > names(coef_dat$other_preliminary) %>% sort()
+# [1] "input"    "mean_lor" "sample"   "se"       "se_mean"  "tau"     
+# [7] "type"    
+coef_outcomes <- c("know_1", "know_2",
+                   "adoption_lime", "adoption_fertilizer",
+                   # "recommended_preliminary", "other_preliminary",
+                   "persistence_lime", "persistence_fert", "fatigue_lime")
+```
+
+First the models:
+
+```{r}
+# Setting priors 
+# These priors Raissa got from Science paper, but not sure this all works in logs 
+# We should probably check with Witold
+priors_custom <- list(hypermean = normal(0,1), 
+                      hypersd = cauchy(0,1))
+
+# Computing the partial pooling models
+coef_mdls <- map(
+  coef_dat[coef_outcomes], function(.x) {
+    baggr(.x,
+          effect = "logarithm of odds ratio",
+          group = "sample",
+          prior = priors_custom,
+          iter = num_iters, chains = num_chains,
+          control=list(adapt_delta=0.99))
+})
+```
+
+Then the outputs:
+```{r}
+baggr_coef_outputs <- function(coef_dat, coef_mdls, outcome) {
+  print(outcome)
+  coef_meta_mdl <- coef_mdls[[outcome]]
+  bg_plot <- baggr::baggr_plot(coef_meta_mdl, hyper = TRUE,
+                               style = "intervals", order = FALSE,
+                               transform = exp, prob = 0.5, prob_outer = 0.95) +
+    geom_vline(xintercept = 1, lty = 2, alpha = 0.2) +
+    xlab("Effect size: Odds ratio")
+  
+  
+  fst_plot <- forest_plot(coef_meta_mdl, show = "both", transform = exp,
+                          effects = "Odds ratio")
+  
+  eff_plot <- baggr::effect_plot(coef_meta_mdl, transform = exp) +
+    xlab("Odds Ratio") +
+    geom_vline(xintercept = 1, lty = 2, alpha = 0.2) +
+    xlim(c(0, 2))
+  
+  comp_mdl <- baggr_compare(
+    coef_dat[[outcome]], effect = "Odds ratio",
+    iter = num_iters, chains = num_chains,
+    control = list(adapt_delta = 0.99, max_treedepth = 15))
+  # comp_mdl <- baggr_compare(coef_meta_mdl)
+
+  comp_plot <- plot(comp_mdl, transform = exp) +
+    geom_hline(yintercept = 1, lty = 2, alpha = 0.2)
+  
+  eff_comp_plot <- effect_plot(
+    partial = comp_mdl$models$partial,
+    full = comp_mdl$models$full,
+    transform = exp) +
+    geom_vline(xintercept = 1, lty = 2, alpha = 0.2) +
+    xlim(c(0, 2))
+  
+  het_est <- heterogeneity(coef_meta_mdl, metric = "isq")[,,1] %>%
+    cbind(pooling(coef_meta_mdl, metric = "isq")[,,1]) %>%
+    as.data.frame() %>%
+    rownames_to_column("stat") %>%
+    set_names(c("Stat", "Overall", attr(coef_meta_mdl$inputs, "group_label")))
+  
+  reg_line <- c(
+    treatment_effect(coef_meta_mdl, summary = TRUE, transform = exp)$tau[1:3],
+    set_names(het_est$Overall)) %>%
+    set_names(c("2.5%", "Mean TE", "97.5%", "2.5%", "I^2", "97.5%"))
+
+  return(list(outcome = outcome,
+              coef_meta_mdl = coef_meta_mdl,
+              bg_plot = bg_plot,
+              fst_plot = fst_plot, eff_plot = eff_plot, comp_mdl = comp_mdl,
+              comp_plot = comp_plot, eff_comp_plot = eff_comp_plot,
+              het_est = het_est, reg_line = reg_line))
+}
+
+coef_outputs <- map(names(coef_mdls),
+                    ~ baggr_coef_outputs(coef_dat, coef_mdls, .x)) %>%
+  set_names(coef_outcomes)
+```
+
+Formatting the output:
+```{r}
+library(huxtable)
+
+(map_dfr(coef_outputs, ~ .x$reg_line) %>%
+  set_names(c("Effect 95% lower", "Effect", "Effect 95% upper",
+              "I^2 95% lower", "$I^2$", "I^2 95% upper")) %>%
+  bind_cols(N = map_dbl(coef_outputs, ~ .x$coef_meta_mdl$n_groups)) %>%
+  bind_cols(Outcome = map_chr(coef_outputs, ~ .x$outcome)) %>%
+  mutate(`Row #` = row_number()) %>%
+  select(`Row #`, Outcome, N, Effect, starts_with("Effect 95"),
+         "$I^2$", starts_with("I^2 95")) -> main_results) %>%
+  as_hux() %>%
+  set_escape_contents(1, 7, FALSE) %>%
+  set_contents(1, c(5, 8), "95% CrI") %>%
+  insert_row("", "", "", "Effects", "", "", "Heterogeneity", "", "", after = 0) %>%
+  insert_row("", "", "(1)", "(2)", "(3)", "(4)", "(5)", "(6)", "(7)",
+             after = 2) %>%
+  merge_cells(1, 4:6) %>% merge_cells(1, 7:9) %>%
+  merge_cells(2, 5:6) %>% merge_cells(2, 8:9) %>%
+  set_align(1:3, 3:9, "center") %>%
+  set_align(everywhere, 1:2, "left") %>%
+  set_number_format(4:7, 4:9, "%.3f") %>%
+  insert_row("", "Odds Ratios", "", "", "", "", "", "", "", after = 3) %>%
+  set_top_border(1, everywhere, brdr(1, "double")) %>%
+  set_bottom_border(final(1), everywhere, brdr(1, "double")) %>%
+  set_bottom_border(3, everywhere, brdr(1, "solid")) %>%
+  set_italic(4, 2) %>%
+  set_all_padding(everywhere, everywhere, 0) -> tbl3
+
+main_results %>%
+  mutate(across(c(where(is.double), -N), ~ format(.x, digits = 3))) %>%
+  write_delim(file  = fs::path("output", "table3_baggr_minimal.tex"),
+              delim = "&", eol = "\\\\\n", quote = "none",
+              col_names = FALSE)
+
+tbl3 %>%
+  quick_latex(file = fs::path("output", "table3_baggr.tex"), open = FALSE)
+
+tbl3 %>%
+  quick_pdf(file = fs::path("output", "table3_baggr.pdf"), open = FALSE)
+
+sapply(coef_outputs, function(mdl) {
+  outcome <- mdl$outcome
+  outputs <- names(mdl)
+  sapply(outputs, function(output) {
+    if (class(mdl[[output]])[[1]] == "gg") {
+      filename <- fs::path("output", str_c(output, "_", outcome, ".png"))
+      ggsave(plot = mdl[[output]], filename = filename)
+    }
+  })
+})
+```
